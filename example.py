@@ -1,8 +1,6 @@
-import multiprocessing
-import queue
+import copy
+import threading
 import time
-import os
-import random
 
 import GPyOpt
 import numpy as np
@@ -18,51 +16,56 @@ class GPyOptAskTellOptimizer:
 
         self.max_iter = max_iter
         self.batch_size = batch_size
-        self.process = None
 
-        self.param_queue = multiprocessing.Queue(maxsize=batch_size)
-        self.value_queue = multiprocessing.Queue(maxsize=batch_size)
+        self.thread = None
+        self.thread = threading.Thread(target=self.job)
+        self.thread.start()
 
-        self.process = multiprocessing.Process(target=self.job)
-        self.process.start()
+        self.lock = threading.Lock()
+        self.ask_params = []  # list[ param ]
+        self.tell_values = []  # list[tuple[ param value ]]
 
     def job(self):
-        # TODO: 何故かrun_optimizationではなくインスタンス化した直後に f が呼ばれ始めるのでmax_iterがどうなってるか調べる。
+        # 何故かrun_optimizationではなくインスタンス化した直後に f が1 iteration実行される
         self.optimizer = GPyOpt.methods.BayesianOptimization(**self.optimizer_opts)
-        self.optimizer.run_optimization(max_iter=self.max_iter)
+        self.optimizer.run_optimization(max_iter=self.max_iter-1)
 
     def stop(self):
-        if self.process is None:
+        if self.thread is None:
             return
 
-        self.process.terminate()
-        self.process = None
+        self.thread.join()
+        self.thread = None
 
     def objective_wrapper(self, x):
-        pid = os.getpid()  # gpyoptはbatch optimizationのときprocessを生成して目的関数を呼ぶので、pidが識別子として使える。
-        self.param_queue.put((pid, x))
+        param = copy.deepcopy(x[0, :])
+        with self.lock:
+            self.ask_params.append(param)
+
+        frozen_params = frozenset(param)
         while True:
-            try:
-                sample_pid, value = self.value_queue.get(block=False)
-                if pid == sample_pid:
-                    break
-                # 別のprocessがsampleしたものはもう一度詰め直す
-                self.value_queue.put((sample_pid, value))
-            except queue.Empty:
-                # 同じのを引き続けるのを防ぐためにrandom sleep.
-                time.sleep(1 * random.random())
-        return value
+            with self.lock:
+                if frozen_params in self.tell_values:
+                    return self.tell_values[frozen_params]
+            time.sleep(0.1)
 
     def ask(self):
-        params = []
-        for i in range(self.batch_size):
-            pid, x = self.param_queue.get(block=True)
-            params.append((pid, x[0, :]))
-        return params  # List[Tuple[int, np.ndarray]]
+        while True:
+            with self.lock:
+                if len(self.ask_params) == self.batch_size:
+                    break
+            time.sleep(0.1)
 
-    def tell(self, values):  # List[Tuple[int, float]]
-        for i in range(self.batch_size):
-            self.value_queue.put(values[i])
+        with self.lock:
+            params = copy.deepcopy(self.ask_params)
+            self.ask_params = []
+        return params  # List[np.ndarray]
+
+    def tell(self, values):  # List[Tuple[np.ndarray, float]]
+        with self.lock:
+            self.tell_values = copy.deepcopy({
+                frozenset(param): v for param, v in values
+            })
 
 
 def f(x0, x1):
@@ -99,9 +102,9 @@ def main():
         params = optimizer.ask()
         y = []
         for i in range(batch_size):
-            x_id, x = params[i]
+            x = params[i]
             value = f(x[0], x[1])
-            y.append((x_id, value))
+            y.append((x, value))
 
             if best_value is None or best_value > value:
                 best_value = value

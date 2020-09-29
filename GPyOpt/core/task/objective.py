@@ -82,22 +82,19 @@ class SingleObjective(Objective):
         Evaluates the function a x, where x can be a single location or a batch. The evaluation is performed in parallel
         according to the number of accessible cores.
         """
-        from multiprocessing import Process, Pipe
+        from concurrent.futures import ThreadPoolExecutor
 
         # --- parallel evaluation of the function
         divided_samples = [x[i::self.n_procs] for i in range(self.n_procs)]
-        pipe = [Pipe() for i in range(self.n_procs)]
-        proc = [Process(target=spawn(self._eval_func),args=(c,k)) for k,(p,c) in zip(divided_samples,pipe)]
-        [p.start() for p in proc]
-        [p.join() for p in proc]
 
         # --- time of evaluation is set to constant (=1). This is one of the hypothesis of synchronous batch methods.
         f_evals = np.zeros((x.shape[0],1))
+        with ThreadPoolExecutor(self.n_procs) as pool:
+            results = pool.map(self._eval_func, [k for k in divided_samples])
+            for i, result in enumerate(results):
+                f_evals[i::self.n_procs] = result[0]
+
         cost_evals = np.ones((x.shape[0],1))
-        i = 0
-        for (p,c) in pipe:
-            f_evals[i::self.n_procs] = p.recv()[0] # throw away costs
-            i += 1
         return f_evals, cost_evals
 
     def _asyncronous_batch_evaluation(self,x):
